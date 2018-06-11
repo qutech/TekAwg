@@ -1,13 +1,25 @@
 #!/usr/bin/env python
-"""Module for communication with and translation of data with a tektronix AWG5000 series."""
+"""Module for communication with and translation of data with a tektronix AWG5000 series.
 
+06.2018 Modified by Simon Hmupohl
+"""
 
+from typing import Sequence, Union, Optional
+from collections import OrderedDict
+import itertools
 import socket
+import pyvisa
+from pyvisa.resources.messagebased import MessageBasedResource
 import time
 import sys
+import warnings
 import numpy as np
 
-class TekAwg(socket.socket):
+
+WaveformId = Union[str, int]
+
+
+class TekAwg:
     """Class which allows communication with a tektronix AWG5000 series (7000 series should work
      as well, but should be tested). This extends the socket class, and uses ethernet TCP/IP
      packets.
@@ -23,16 +35,33 @@ class TekAwg(socket.socket):
 
     """
 
-
-    def __init__(self, ip, port):
-        """Initialize connection and set timout to 500ms
+    def __init__(self, instrument: str):
+        """Initialize connection and set timout to 1000ms
 
             Raises: socket.error"""
-        socket.socket.__init__(self)
-        self.connect((ip, port))
-        self.settimeout(1)
 
-    def write(self, message, expect_response=False, expected_length=1):
+        if isinstance(instrument, str):
+            instrument = pyvisa.ResourceManager().open_resource(instrument, read_termination='\n')
+
+        self._inst = instrument
+
+        self._n_channels = None
+
+    @property
+    def n_channels(self) -> int:
+        if self._n_channels is None:
+            self._n_channels = int(self.query('AWGControl:CONFigure:CNUMber?', expected_responses=1))
+        return self._n_channels
+
+    @property
+    def instrument(self) -> MessageBasedResource:
+        return self._inst
+
+    @classmethod
+    def connect_to_ip(cls, ip: str, port: int):
+        return cls('TCPIP::{ip}::{port}::SOCKET'.format(ip=ip, port=port))
+
+    def write(self, message: str, expected_responses=0) -> Optional[str]:
         """Sends text commands to the AWG5000 Series, no newline or return character required
 
             Args:
@@ -50,41 +79,32 @@ class TekAwg(socket.socket):
             Raises:
                 IOError if a response was expected but not recieved
             """
-        return self.__write_helper(message, expect_response, expected_length)
+        return self._write_helper(message, expected_responses)
 
-    def __write_helper(self, message, expect_response, expected_length, depth=3, cur_depth=0):
-        """This is the helper for the write command, this allows for multiple attempts to recieve
+    def query(self, query: str, expected_responses=1):
+        result = self.write(query, expected_responses=expected_responses)
+        return result[0] if expected_responses == 1 else tuple(result)
+
+    def _write_helper(self, message, expected_responses: Union[int, bool]) -> Optional[Union[str, Sequence[str]]]:
+        """This is the helper for the write command, this allows for multiple attempts to receive
         a response when a response is expected.
         """
 
-        if depth == cur_depth:
-            raise IOError("Failed to recieve response. Check to be sure spelling of command is "
-                          "correct and there is no newline character at the end of the string.")
+        if expected_responses:
+            result = self.instrument.query(message)
 
-        #Send the message
-        self.send(message+"\n")
+            if expected_responses is True:
+                return result
+            else:
+                result = result.split(';')
 
-        #if we are expecting a response, wait until we get the full response back, if not, try again
-        if expect_response:
-            try:
-                response = self.recv(10) #Get some response?
-                while (len(response.split(";")) < expected_length
-                       or len(response) < 1
-                       or response[-1] != "\n"):
-                    #keep going until we are satisfied
-                    response = response+self.recv(100)
+            if len(result) != expected_responses:
+                raise IOError('Got {} responses but expected  {}.'.format(len(result),
+                                                                          expected_responses), result)
+            return result
 
-                return response.strip() #strip off the "\r\n and return"
-
-            except socket.timeout: #If we time out, try again, print a warning so we know
-                cur_depth += 1
-                print ("Timeout. Trying to send {} again "
-                       "(Attempt {} of {})".format(repr(message.strip()[:100]), cur_depth, depth))
-                #try again
-                return self.__write_helper(message, expect_response, expected_length, depth, cur_depth)
-
-        #if no response expected, return None
-        return None
+        else:
+            self.instrument.write(message)
 
     def get_error_queue(self):
         err_queue = []
@@ -93,6 +113,32 @@ class TekAwg(socket.socket):
             err_queue.append(self.write("SYSTEM:ERR?",True))
             err_num = int(self.write("*ESR?", True)[0])
         return err_queue
+
+
+#############  GETTING SETTINGS   #########################
+    def get_waveform_info(self) -> OrderedDict:
+        waveform_names = self.get_waveform_names()
+
+        result = OrderedDict()
+
+        result['names'] = self.get_waveform_names()
+
+        try:
+            result['length'] = self.get_waveform_lengths(waveform_names)
+        except IOError:
+            pass
+
+        try:
+            result['type'] = self.get_waveform_types(waveform_names)
+        except IOError:
+            pass
+
+        try:
+            result['timestamp'] = self.get_waveform_types(waveform_names)
+        except IOError:
+            pass
+
+        return result
 
 #############  PRINTING SETTINGS   #########################
 
@@ -107,7 +153,7 @@ class TekAwg(socket.socket):
 
         #get list of waveforms, and count how many we have
         try:
-            waveform_list = self.get_waveform_list()
+            waveform_list = self.get_waveform_names()
             num_saved_waveforms = len(waveform_list)
         except IOError:
             return -1
@@ -119,45 +165,45 @@ class TekAwg(socket.socket):
             con_error = True
 
         try:
-            waveform_types = self.get_waveform_type(waveform_list)
+            waveform_types = self.get_waveform_types(waveform_list)
         except IOError:
             waveform_types = ["" for _ in range(num_saved_waveforms)]
             con_error = True
 
         try:
-            waveform_date = self.get_waveform_timestamp(waveform_list)
+            waveform_date = self.get_waveform_timestamps(waveform_list)
         except IOError:
             waveform_date = ["" for _ in range(0, num_saved_waveforms)]
             con_error = True
 
-        print "\nList of waveforms in memory:"
-        print "\nIndex \t Name\t\t\t\t Data Points \tType\t\tDate"
+        print("\nList of waveforms in memory:")
+        print("\nIndex \t Name\t\t\t\t Data Points \tType\t\tDate")
         for i in range(num_saved_waveforms):
-            print ('{0:<9}{1: <32}{2: <15}{3:<16}{4:<5}'.format(i+1,
+            print('{0:<9}{1: <32}{2: <15}{3:<16}{4:<5}'.format(i+1,
                                                                 waveform_list[i],
                                                                 waveform_lengths[i],
                                                                 waveform_types[i],
                                                                 waveform_date[i]))
 
         if con_error:
-            print "\nConnection Error, partial list printed only"
+            print("\nConnection Error, partial list printed only")
             return -1
         else:
             return 0
 
     def print_config(self):
         """Print the current configuration of the AWG"""
-        print "\n\nCurrent Settings\n"
-        print "Hardware ID:     ", self.get_serial()
-        print "Run Mode:        ", self.get_run_mode()
-        print "Run State:       ", self.get_run_state()
-        print "Frequency:       ", self.get_freq()
+        print("\n\nCurrent Settings\n")
+        print("Hardware ID:     ", self.get_serial())
+        print("Run Mode:        ", self.get_run_mode())
+        print("Run State:       ", self.get_run_state())
+        print("Frequency:       ", self.get_freq())
 
         cur_waves = self.get_cur_waveform()
         cur_amp = self.get_amplitude()
         cur_offset = self.get_offset()
         chan_state = self.get_chan_state()
-        print "\nChannel Settings"
+        print("\nChannel Settings")
         print ('%-15s%-15s%-15s%-15s%-15s' %
                ("Setting", "Channel 1", "Channel 2", "Channel 3", "Channel 4"))
         print ('%-15s%-15s%-15s%-15s%-15s' %
@@ -171,7 +217,7 @@ class TekAwg(socket.socket):
 
 
         seq_list = self.get_seq_list()
-        print "\nCurrent Sequence:"
+        print("\nCurrent Sequence:")
         print ('%-15s%-15s%-15s%-15s%-15s%-15s%-15s' %
                ("Index", "Channel 1", "Channel 2", "Channel 3",
                 "Channel 4", "Loop Count", "Jump Target"))
@@ -182,43 +228,46 @@ class TekAwg(socket.socket):
                    (i+1, seq_list[i][0], seq_list[i][1], seq_list[i][2],
                     seq_list[i][3], loop_count, jump_trg))
 
-        print ""
+        print("")
 
 
 ################  WAVEFORMS    #############################
 
-    def get_waveform_list(self):
+    def get_waveform_names(self, waveform_indices: Union[Sequence[int], int, None]=None) -> Union[Sequence[str], str]:
         """Returns a list of all the currently saved waveforms on the AWG"""
 
-        num_saved_waveforms = int(self.write("WLIST:SIZE?", True))
+        if waveform_indices is None:
+            num_saved_waveforms = int(self.write("WLIST:SIZE?", True))
+            waveform_indices = range(num_saved_waveforms)
+        elif isinstance(waveform_indices, int):
+            return self.get_waveform_names([waveform_indices])[0]
+
+        waveform_indices = list(waveform_indices)
 
         waveform_list_cmd = 'WLIST:'
-        waveform_list_cmd += ";".join(["NAME? "+str(i) for i in range(0, num_saved_waveforms)])
+        waveform_list_cmd += ";".join(["NAME? " + str(i) for i in waveform_indices])
 
-        waveform_list = self.write(waveform_list_cmd, True, num_saved_waveforms).split(";")
+        waveform_names = self.write(waveform_list_cmd, len(waveform_indices))
 
-        return waveform_list
+        return waveform_names
 
-    def get_waveform_lengths(self, waveform_list):
+    def get_waveform_lengths(self, waveform_ids: Union[Sequence[WaveformId], WaveformId]) -> Union[Sequence[int], int]:
         """Returns a list of lengths of all saved waveforms on the AWG"""
-        if not isinstance(waveform_list, list):
-            waveform_list = list(waveform_list)
+        if isinstance(waveform_ids, (str, int)):
+            return self.get_waveform_lengths([waveform_ids])[0]
 
-        num_saved_waveforms = len(waveform_list)
+        waveform_ids = [str(name) for name in waveform_ids]
 
-        if num_saved_waveforms > 1:
-            waveform_length_cmd = 'WLIST:WAVeform:'+";".join(["LENGTH? "+ i for i in waveform_list])
-            waveform_lengths = self.write(waveform_length_cmd, True, num_saved_waveforms).split(";")
-        else:
-            waveform_length_cmd = 'WLIST:WAVeform:LENGTH? '+str(waveform_list)
-            waveform_lengths = self.write(waveform_length_cmd, True).split(";")
+        num_requests = len(waveform_ids)
 
-        if len(waveform_lengths) == num_saved_waveforms:
-            return waveform_lengths
-        else:
-            raise IOError("Failed to retrieve lengths of all waveforms.")
+        waveform_length_cmd = 'WLIST:WAVeform:' + ";".join(["LENGTH? " + i for i in waveform_ids])
+        waveform_lengths = self.write(waveform_length_cmd, num_requests)
 
-    def get_waveform_type(self, waveform_list):
+        waveform_lengths = [int(length) for length in waveform_lengths]
+
+        return waveform_lengths
+
+    def get_waveform_types(self, waveform_ids: Union[Sequence[str], str]) -> Union[Sequence[str], str]:
         """returns the type of waveform which is stored on the AWG, IE: the AWG saves waveforms
         as either Integer ("INT") or Floating Point ("REAL") representations.
 
@@ -229,25 +278,22 @@ class TekAwg(socket.socket):
 
             Raises:
                 IOError if fewer types were returned then asked for"""
+        if isinstance(waveform_ids, (str, int)):
+            return self.get_waveform_types([waveform_ids])[0]
 
-        if not isinstance(waveform_list, list):
-            waveform_list = list(waveform_list)
+        elif not isinstance(waveform_ids, (list, tuple)):
+            waveform_ids = list(waveform_ids)
 
-        num_saved_waveforms = len(waveform_list)
+        num_requests = len(waveform_ids)
 
-        if num_saved_waveforms > 1:
-            waveform_type_cmd = 'WLIST:WAVeform:'+";".join(["TYPE? "+ str(i) for i in waveform_list])
-            waveform_type = self.write(waveform_type_cmd, True, num_saved_waveforms).split(";")
-        else:
-            waveform_type_cmd = 'WLIST:WAVeform:TYPE? '+str(waveform_list)
-            waveform_type = self.write(waveform_type_cmd, True).split(";")
+        waveform_type_cmd = 'WLIST:WAVeform:' + ";".join(["TYPE? " + str(name) for name in waveform_ids])
 
-        if len(waveform_type) == num_saved_waveforms:
-            return waveform_type
-        else:
-            raise IOError("Failed to retrieve lengths of all waveforms.")
+        try:
+            return self.write(waveform_type_cmd, num_requests)
+        except IOError as err:
+            raise IOError("Failed to retrieve lengths of all waveforms.") from err
 
-    def get_waveform_timestamp(self, waveform_list):
+    def get_waveform_timestamps(self, waveform_ids: Union[Sequence[str], str]) -> Union[Sequence[str], str]:
         """Returns the creation/edit timestamp of waveforms which are stored on the AWG,
 
             Args:
@@ -257,33 +303,23 @@ class TekAwg(socket.socket):
 
             Raises:
                 IOError if fewer types were returned then asked for"""
+        if isinstance(waveform_ids, (str, int)):
+            return self.get_waveform_timestamps([waveform_ids])[0]
 
-        if not isinstance(waveform_list, list):
-            waveform_list = list(waveform_list)
+        waveform_ids = self._parse_waveform_id(waveform_ids)
 
-        num_saved_waveforms = len(waveform_list)
+        num_requests = len(waveform_ids)
 
-        if num_saved_waveforms > 1:
-            waveform_date_cmd = 'WLIST:WAVeform:'+";".join(["TSTAMP? "+ str(i) for i in waveform_list])
-            waveform_date = self.write(waveform_date_cmd, True, num_saved_waveforms).split(";")
-        else:
-            waveform_date_cmd = 'WLIST:WAVeform:TSTAMP? '+str(waveform_list)
-            waveform_date = self.write(waveform_date_cmd, True).split(";")
+        waveform_date_cmd = 'WLIST:WAVeform:' + ";".join(["TSTAMP? " + str(name) for name in waveform_ids])
 
-        if len(waveform_date) == num_saved_waveforms:
-            return waveform_date
+        waveform_dates = self.write(waveform_date_cmd, num_requests)
+
+        if len(waveform_dates) == num_requests:
+            return waveform_dates
         else:
             raise IOError("Failed to retrieve lengths of all waveforms.")
 
-
-    def get_waveform_data(self, filename):
-        """"""
-        raw_waveform_str = self.__get_waveform_data(filename)
-        str_type = self.write('WLISt:WAVeform:TYPE? "'+filename+'"', True)
-        return byte_str_to_vals(raw_waveform_str, str_type)
-
-
-    def __get_waveform_data(self, filename):
+    def get_waveform_data(self, waveform_name, chunk_size=10*2**10):
         """Get the raw waveform data from the AWG, this will be in the packed format containing
         both the channel waveforms as well as the markers, this needs to be correctly formatted.
             Args:
@@ -294,32 +330,32 @@ class TekAwg(socket.socket):
             Raises:
                 IOError if there was a timeout, most likely due to connection or incorrect name
         """
-        self.send(str('WLISt:WAVeform:DATA? "'+filename+'"\r\n'))
-        time.sleep(.05)
+        waveform_name = self._parse_waveform_id(waveform_name)
 
-        raw_waveform = ""
-        waveform_length = 5
-        timeouts = 0
-        while len(raw_waveform) < 2 or len(raw_waveform) <= waveform_length:
-            if timeouts >= 5:
-                raise IOError("Timeout. Failed to get waveform")
-            try:
-                raw_waveform = "".join([raw_waveform, self.recv(10000)])
-            except socket.error as e:
-                print e
-                time.sleep(1)
-                timeouts += 1
-            if len(raw_waveform) > 5:
-                num_digits = int(raw_waveform[1])
-                waveform_length = int(raw_waveform[2:2+num_digits])
+        wf_length = self.get_waveform_lengths(waveform_name)
+        data_type = self.get_waveform_types(waveform_name)
+        if data_type == 'REAL':
+            data_type = 'f'
+        else:
+            data_type = 'H'
 
-        raw_waveform = raw_waveform.strip()[num_digits+2:]
+        n_chunks = (wf_length + chunk_size - 1) // chunk_size
 
-        #waveform = list(struct.unpack("<"+"fx"*(waveform_length/5),raw_waveform))
+        waveform_data_cmd = 'WLISt:WAVeform:DATA? %s,{start}, {size}' % waveform_name
 
-        return raw_waveform
+        waveform_data = []
 
+        remaining_points = wf_length
+        for chunk in range(n_chunks):
+            cmd = waveform_data_cmd.format(start=chunk*chunk_size, size=min(chunk_size, remaining_points))
 
+            received = self.instrument.query_binary_values(cmd, datatype=data_type, container=np.ndarray,
+                                                           header_fmt='ieee')
+
+            waveform_data.append(received)
+            remaining_points -= chunk_size
+
+        return np.concatenate(waveform_data)
 
     def new_waveform(self, filename, packed_data, packet_size=20000):
         """Creates a new waveform on the AWG and saves the data. It has error checking
@@ -349,6 +385,36 @@ class TekAwg(socket.socket):
         self.__new_waveform_int(filename, packed_data, packet_size)
         return None
 
+    def _new_waveform(self, waveform_name, data: np.ndarray, chunk_size=10*2**10):
+        if data.dtype == np.uint16:
+            data_type = 'INT'
+        elif data.dtype == np.float32:
+            data_type = 'REAL'
+        else:
+            raise TypeError('Invalid data type', data.dtype)
+
+        wf_length = data.size
+
+        waveform_name = "%s" % waveform_name.strip('"')
+
+        self.write('WLISt:WAVeform:NEW {name},{size},{data_type}'.format(name=waveform_name,
+                                                                         size=wf_length,
+                                                                         data_type=data_type))
+
+        data_cmd = 'WLIST:WAVEFORM:DATA {name},{offset},{size},'
+
+        n_chunks = (wf_length + chunk_size - 1) // chunk_size
+        remaining_points = wf_length
+        for chunk in range(n_chunks):
+            self.instrument.write_binary_values(
+                data_cmd.format(name=waveform_name,
+                                offset=chunk*chunk_size,
+                                size=min(chunk_size, remaining_points)),
+                data[chunk*chunk_size:(chunk+1)*chunk_size],
+                datatype=data.dtype.char,
+                termination=self.instrument.write_termination
+            )
+            remaining_points -= chunk_size
 
     def __new_waveform_int(self, filename, packed_data, packet_size):
         """This is the helper function which actually sends the waveform to the AWG, see above."""
@@ -357,8 +423,7 @@ class TekAwg(socket.socket):
         #    print errs,
         data_length = len(packed_data)
 
-        self.settimeout(1)
-        if '"'+filename+'"' in self.get_waveform_list():
+        if '"'+filename+'"' in self.get_waveform_names():
             self.del_waveform(filename)
 
         self.write('WLISt:WAVeform:NEW "'+filename+'",'+str(data_length/2)+",INT")
@@ -387,9 +452,8 @@ class TekAwg(socket.socket):
                        +"\r\n")
 
         errs = self.get_error_queue()
-        if errs != []:
-            print errs,
-        self.settimeout(.5)
+        if errs:
+            warnings.warn('ERRORS: ' + '; '.join(errs))
 
     def del_waveform(self, filename):
         """Delete Specified Waveform"""
@@ -399,36 +463,37 @@ class TekAwg(socket.socket):
 
 #######################   AWG SETTINGS  ############################
 
-    def get_serial(self):
+    def get_serial(self) -> str:
         """Returns the hardware serial number and ID as a string"""
-        return self.write("*IDN?", True)
+        return self.query("*IDN?")
 
     def get_freq(self):
         """Returns the current sample rate of the AWG"""
-        return self.write("FREQ?", True)
+        return self.query("FREQ?")
 
     def set_freq(self, freq):
         """Sets the current sample rate of the AWG"""
         self.write("FREQ "+str(freq))
 
-
     def get_run_mode(self):
         """Gets the current running mode of the AWG: SEQ, CONT, TRIG, GAT"""
-        return self.write("AWGCONTROL:RMODE?", True)
+        return self.query("AWGCONTROL:RMODE?")
 
     def set_run_mode(self, mode):
         """Sets the run mode of the AWG, allowed modes are:
             continuous, triggered, gated, sequence"""
         if mode.lower() in ["continuous", "cont",
-                            "trigered", "trig",
+                            "triggered", "trig",
                             "gated", "gat",
                             "sequence", "seq"]:
             self.write("AWGCONTROL:RMODE "+mode)
+        else:
+            raise RuntimeError('Invalid mode', mode)
 
     def get_run_state(self):
         """Gets the current state of the AWG, possible states are:
         stopped, waiting for trigger, or running"""
-        state = self.write("AWGControl:RSTate?", True)
+        state = self.query("AWGControl:RSTate?")
         if state == "0":
             return "Stopped"
         elif state == "1":
@@ -445,35 +510,51 @@ class TekAwg(socket.socket):
         """Stop the AWG"""
         self.write("AWGCONTROL:STOP")
 
+    def _parse_channel(self, channel) -> Sequence[str]:
+        if channel is None:
+            channel = range(1, 1 + self.n_channels)
+        elif isinstance(channel, (int, str)):
+            channel = [channel]
+        return [str(int(ch)) for ch in channel]
+
+    def _parse_waveform_id(self, waveform_id):
+        if isinstance(waveform_id, int):
+            return str(waveform_id)
+        elif isinstance(waveform_id, str):
+            try:
+                return str(int(waveform_id))
+            except ValueError:
+                return '"%s"' % waveform_id.strip('"')
+
+        return [self._parse_waveform_id(wf_id)
+                for wf_id in waveform_id]
+
     def get_amplitude(self, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
-        cmd_str = ';'.join([':SOURCE'+str(c)+':VOLTAGE?' for c in channel])
-        return [float(x) for x in self.write(cmd_str, True, len(channel)).split(";")]
+        channel = self._parse_channel(channel)
+        cmd_str = ';'.join([':SOURCE' + c + ':VOLTAGE?' for c in channel])
+        return [float(x) for x in self.write(cmd_str, len(channel))]
 
     def set_amplitude(self, amplitude, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
-        if not isinstance(amplitude, list): amplitude = [amplitude]*len(channel)
+        channel = self._parse_channel(channel)
+        if not isinstance(amplitude, (list, tuple)):
+            amplitude = [amplitude]*len(channel)
 
         if len(amplitude) != len(channel):
             raise ValueError("Number of channels does not match number of amplitudes.")
 
         cmd_str = []
         for i in range(len(channel)):
-            cmd_str.append(':SOURCE'+str(int(channel[i]))+':VOLTAGE '+str(amplitude[i]) )
+            cmd_str.append(':SOURCE'+str(int(channel[i]))+':VOLTAGE '+str(amplitude[i]))
         cmd_str = ';'.join(cmd_str)
         self.write(cmd_str)
 
     def get_offset(self, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':SOURCE'+str(c)+':VOLTAGE:OFFSET?' for c in channel])
-        return [float(x) for x in self.write(cmd_str, True, len(channel)).split(";")]
+        return [float(x) for x in self.write(cmd_str, len(channel))]
 
     def set_offset(self, offset, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         if not isinstance(offset, list): offset = [offset]*len(channel)
 
         if len(offset) != len(channel):
@@ -481,21 +562,19 @@ class TekAwg(socket.socket):
 
         cmd_str = []
         for i in range(len(channel)):
-            cmd_str.append(':SOURCE'+str(channel[i])+':VOLTAGE:OFFSET '+str(offset[i]) )
+            cmd_str.append(':SOURCE'+str(channel[i])+':VOLTAGE:OFFSET '+str(offset[i]))
         cmd_str = ';'.join(cmd_str)
         self.write(cmd_str)
 
     def get_marker_high(self, marker, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':SOURCE'+str(c)+':MARKER'+str(int(marker))+':VOLTAGE:HIGH?' for c in channel])
-        return [float(x) for x in self.write(cmd_str, True, len(channel)).split(";")]
+        return [float(x) for x in self.write(cmd_str, len(channel))]
 
     def set_marker_high(self, voltage, marker, channel=None):
         """Set whether the channels are on or off, where 0 means off and 1 means on"""
         assert int(marker) in [1,2]
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         if not isinstance(voltage, list): voltage = [voltage]*len(channel)
 
         if len(voltage) != len(channel):
@@ -507,16 +586,14 @@ class TekAwg(socket.socket):
         self.write(cmd_str)
 
     def get_marker_low(self, marker, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':SOURCE'+str(int(c))+':MARKER'+str(int(marker))+':VOLTAGE:LOW?' for c in channel])
-        return [float(x) for x in self.write(cmd_str, True, len(channel)).split(";")]
+        return [float(x) for x in self.write(cmd_str, len(channel))]
 
     def set_marker_low(self, voltage, marker, channel=None):
         """Set whether the channels are on or off, where 0 means off and 1 means on"""
         assert int(marker) in [1,2]
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         if not isinstance(voltage, list): voltage = [voltage]*len(channel)
 
         if len(voltage) != len(channel):
@@ -525,18 +602,16 @@ class TekAwg(socket.socket):
         cmd_str = ''
         for i in range(len(channel)):
             cmd_str = cmd_str + ';:SOURCE{}:MARKER{}:VOLTAGE:LOW {}'.format(int(channel[i]),int(marker),voltage[i])
-        self.write(cmd_str)    
+        self.write(cmd_str)
 
     def get_chan_state(self, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':OUTPUT'+str(c)+'?' for c in channel])
-        return [int(x) for x in self.write(cmd_str, True, len(channel)).split(";")]
+        return [int(x) for x in self.write(cmd_str, len(channel))]
 
     def set_chan_state(self, state, channel=None):
         """Set whether the channels are on or off, where 0 means off and 1 means on"""
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         if not isinstance(state, list): state = [state]*len(channel)
 
         if len(state) != len(channel):
@@ -568,20 +643,17 @@ class TekAwg(socket.socket):
 ####################  SEQUENCER ######################
 
     def get_cur_waveform(self, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':SOURCE'+str(c)+':WAV?' for c in channel])
-        return self.write(cmd_str, True, len(channel)).split(";")
+        return self.write(cmd_str, len(channel))
 
     def set_cur_waveform(self, waveform_name, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':SOURCE'+str(c)+':WAV "'+waveform_name+'"' for c in channel])
         self.write(cmd_str)
 
     def set_seq_element(self, element_index, waveform_name, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':Sequence:ELEM'
                             +str(element_index)
                             +':WAV'+str(c)
@@ -591,19 +663,21 @@ class TekAwg(socket.socket):
         self.write(cmd_str)
 
     def get_seq_element(self, element_index, channel=None):
-        if channel is None: channel = [1, 2, 3, 4]
-        if not isinstance(channel, list): channel = [channel]
+        channel = self._parse_channel(channel)
         cmd_str = ';'.join([':Sequence:ELEM'+str(element_index)+':WAV'+str(c)+"?" for c in channel])
-        return self.write(cmd_str, True, expected_length=len(channel)).split(";")
+        return self.write(cmd_str, len(channel))
 
-    def get_seq_element_loop_cnt(self, element_index):
-        return self.write('SEQuence:ELEMent'+str(element_index)+':LOOP:COUNt?', True)
+    def get_seq_element_loop_cnt(self, element_index) -> int:
+        return int(self.query('SEQuence:ELEMent'+str(element_index)+':LOOP:COUNt?'))
 
     def set_seq_element_loop_cnt(self, element_index, count):
         return self.write('SEQuence:ELEMent'+str(element_index)+':LOOP:COUNt '+str(count))
 
+    def get_seq_element_loop_inf(self, element_index) -> bool:
+        return int(self.query('SEQuence:ELEMent'+str(element_index)+':LOOP:INFinite?')) == 1
+
     def get_seq_length(self):
-        return int(self.write('SEQ:LENGTH?', True, 1))
+        return int(self.query('SEQ:LENGTH?'))
 
     def set_seq_length(self, length):
         self.write('SEQ:LENGTH '+str(length))
@@ -611,7 +685,7 @@ class TekAwg(socket.socket):
     def get_seq_element_jmp_ind(self, element_index):
         tar_type = self.get_seq_element_jmp_type(element_index)
         if tar_type == "IND":
-            return self.write('SEQuence:ELEMent'+str(element_index)+':JTARget:INDex?', True, 1)
+            return self.query('SEQuence:ELEMent'+str(element_index)+':JTARget:INDex?')
         else:
             return tar_type
 
@@ -620,44 +694,83 @@ class TekAwg(socket.socket):
         self.write('SEQuence:ELEMent'+str(element_index)+':JTARget:INDex '+str(target))
 
     def get_seq_element_jmp_type(self, element_index):
-        return self.write('SEQuence:ELEMent'+str(element_index)+':JTARget:TYPE?', True, 1)
+        return self.query('SEQuence:ELEMent'+str(element_index)+':JTARget:TYPE?')
 
     def set_seq_element_jmp_type(self, element_index, tar_type):
         if tar_type.lower() in ["index", "ind", "next", "off"]:
             return self.write('SEQuence:ELEMent'+str(element_index)+':JTARget:TYPE '+str(tar_type))
 
+    def get_seq_element_goto_state(self, element_index) -> bool:
+        return int(self.query('SEQuence:ELEMent' + str(element_index) + ':GOTO:STAT?')) == 1
+
+    def get_seq_element_goto_ind(self, element_index) -> int:
+        return int(self.query('SEQuence:ELEMent' + str(element_index) + ':GOTO:IND?'))
+
+    def get_seq_element_wait(self, element_index) -> bool:
+        return self.query('SEQuence:ELEMent' + str(element_index) + ':TWA?') == 'ON'
+
     def get_seq_list(self):
         """Get the current list of waveforms in the sequencer"""
-        seq_length = self.get_seq_length()
-        seq_list = ["" for _ in range(seq_length)]
+        return [self.get_seq_element(i)
+                for i in range(1, 1+self.get_seq_length())]
 
-        for i in range(seq_length):
-            seq_list[i] = self.get_seq_element(i+1)
-        return seq_list
-
-    def set_seq_list(self, seq_list):
+    def set_seq_list(self, seq_list, position):
         """Set the sequence list"""
-        assert isinstance(seq_list, list)
-        assert isinstance(seq_list[0], list)
-        assert len(seq_list[0]) == 4
 
-        seq_len = len(seq_list)
+        if isinstance(position, int):
+            position = itertools.count(position)
 
-        #self.set_seq_length(0) #Delete old sequence list
-        self.set_seq_length(seq_len)
-        cmd_str = ""
-        for i in range(seq_len):
-            for k in range(4):
-                cmd_str = cmd_str+';:Seq:ELEM'+str(i+1)+':WAV'+str(k+1)+' "'+seq_list[i][k]+'"'
-            if i < seq_len:
-                cmd_str = cmd_str+';:SEQ:ELEM'+str(i+1)+':JTAR:TYPE NEXT'
-        self.settimeout(10)
-        self.write(cmd_str)
-        self.settimeout(.5)
+        position = list(itertools.islice(position, len(seq_list)))
 
+        seq_len = self.get_seq_length()
 
-import numpy as np
-import sys
+        cmd = []
+        for pos, (entries, wait, repeat, event_jump, goto) in zip(position, seq_list):
+            if pos > seq_len:
+                raise ValueError('Invalid position')
+
+            if len(entries) != self.n_channels:
+                raise ValueError('Invalid channel count')
+
+            base = ':SEQ:ELEM{pos}:'.format(pos=pos)
+
+            for ch, entry in enumerate(entries):
+                if entry is not None:
+                    cmd.append(
+                        base + 'WAV{ch} {entry}'.format(ch=ch+1, entry=entry)
+                    )
+
+            if wait is not None:
+                cmd.append(
+                    base + 'TWA {wait}'.format(wait=int(wait))
+                )
+
+            if repeat is not None:
+                if repeat == float('inf'):
+                    cmd.append(base + 'LOOP:INF 1')
+
+                else:
+                    cmd.append(base + 'LOOP:INF 0')
+
+                    cmd.append(base + 'LOOP:COUNT %d' % repeat)
+
+            if event_jump:
+                raise NotImplementedError()
+
+            if goto is not None:
+                if goto is False:
+                    cmd.append(base + 'GOTO:STAT 0')
+                else:
+                    cmd.append(base + 'GOTO:STAT 1')
+                    cmd.append(base + 'GOTO:IND %d' % goto)
+
+        chunk_size = 32
+        chunk_num = (len(cmd) + chunk_size - 1) // chunk_size
+
+        for chunk in range(chunk_num):
+            cmd_chunk = ";".join(itertools.islice(cmd, chunk*chunk_size, (chunk+1)*chunk_size))
+            self.write(cmd_chunk)
+
 
 #These are the bit conversions needed for accurate representation on the AWG
 _bit_depth_mult_offset = {8:  (127, 127),
@@ -869,9 +982,5 @@ def unmerge_arb_and_markers(codes):
 
 class UnequalPatternLengths(Exception):
     pass
-
-
-
-
 
 
