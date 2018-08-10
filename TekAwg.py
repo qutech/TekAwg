@@ -8,7 +8,7 @@ from typing import Sequence, Union, Optional, Tuple, Iterable, cast, Callable, A
 import types
 from collections import OrderedDict
 import itertools
-import sys
+import re
 import warnings
 
 import pyvisa
@@ -195,6 +195,24 @@ class SequenceEntry:
         return 8
 
 
+class CommandGroup:
+    """Bundles commands and minimizes subsystem/prefix selections. Does not really increase speed."""
+    def __init__(self):
+        self.command_list = []
+        self.current_prefix = ''
+
+    def append(self, required_prefix, local_command):
+        if required_prefix == self.current_prefix:
+            command = local_command
+        else:
+            command = required_prefix + local_command
+            self.current_prefix = required_prefix
+        self.command_list.append(command)
+
+    def build(self) -> str:
+        return ';'.join(self.command_list)
+
+
 class TekAwg:
     """Class which allows communication with a tektronix AWG5000 series (7000 series should work
      as well, but should be tested). It uses pyvisa as backend.
@@ -214,12 +232,53 @@ class TekAwg:
 
         self._n_channels = None
         self._check_for_errors = True
+        self._model = None
 
     @property
     def n_channels(self) -> int:
         if self._n_channels is None:
             self._n_channels = int(self.query('AWGControl:CONFigure:CNUMber?', expected_responses=1))
         return self._n_channels
+
+    @property
+    def model(self) -> str:
+        if self._model is None:
+            idn = self.query('*IDN?')
+            manufacturer, model, *_ = idn.split(',')
+            if manufacturer.upper() != 'TEKTRONIX':
+                warnings.warn('Unexpected manufacturer: %s' % manufacturer)
+            self._model = model
+        return self._model
+
+    @property
+    def properties(self) -> dict:
+        regex_5000 = re.compile(r'^AWG50\d\d[A-C]$')
+        regex_7000 = re.compile(r'^AWG70\d\d[A-C]$')
+
+        if regex_5000.match(self.model):
+            # See AWG5000 data sheet & AWG software "Sequencer Mode" help page
+            return {'MAX_SEQUENCE_LENGTH': 8000,
+                    'MAX_NUMBER_WAVEFORMS': 16200,
+                    'MAX_SEQUENCE_COUNTER': 65536,
+                    'MIN_WAVEFORM_LENGTH': 250,
+                    'WAVEFORM_GRANULARITY': 1}
+
+        if regex_7000.match(self.model):
+            # See AWG7000 data sheet & AWG software "Sequencer Mode" help page
+            properties = {'MAX_SEQUENCE_LENGTH': 4000,
+                          'MAX_NUMBER_WAVEFORMS': 16000,
+                          'MAX_SEQUENCE_COUNTER': 65536,
+                          'MIN_WAVEFORM_LENGTH': 960,
+                          'WAVEFORM_GRANULARITY': 64}
+
+            if self.model in ('AWG7000B', 'AWG7000C'):
+                # See "Sequencer Mode" help page of AWG software
+                properties['WAVEFORM_GRANULARITY'] = 4
+
+            return properties
+
+        else:
+            raise RuntimeError('Properties not known for model "%s"' % self.model)
 
     @property
     def instrument(self) -> MessageBasedResource:
@@ -462,9 +521,11 @@ class TekAwg:
         """Returns a list of lengths of all saved waveforms on the AWG"""
         if isinstance(waveform_names, str):
             return self.get_waveform_lengths([waveform_names])[0]
+        else:
+            waveform_names = self._parse_waveform_names(waveform_names)
 
         waveform_lengths = self.query_chunked(
-            map(':WLIST:WAV:LENG? {}'.format, waveform_names),
+            (':WLIST:WAV:LENG? %s' % waveform_name for waveform_name in waveform_names),
             converter=int, expected_responses=len(waveform_names), chunk_size=16
         )
 
@@ -511,7 +572,7 @@ class TekAwg:
             expected_responses=len(waveform_names), chunk_size=16
         )
 
-    def get_waveform_data(self, waveform_name, chunk_size=10*2**10) -> Waveform:
+    def get_waveform_data(self, waveform_name: str, chunk_size=10*2**10) -> Waveform:
         """Get the raw waveform data from the AWG
             Args:
                 waveform_name: Name of the waveform to get
@@ -521,7 +582,7 @@ class TekAwg:
             Raises:
                 IOError if there was a timeout, most likely due to connection or incorrect name
         """
-        waveform_name = self._parse_waveform_names(waveform_name)
+        waveform_name = self._parse_waveform_name(waveform_name)
 
         wf_length = self.get_waveform_lengths(waveform_name)
         data_type = self.get_waveform_types(waveform_name)
@@ -641,6 +702,9 @@ class TekAwg:
     def stop(self):
         """Stop the AWG"""
         self.write("AWGCONTROL:STOP")
+
+    def jump_to_sequence_element(self, element_index):
+        self.write('AWGC:EVEN:SOFT %d' % element_index)
 
     def _parse_channel(self, channel: Optional[Union[int, str, Iterable[Union[int, str]]]]) -> Tuple[Sequence[str], bool]:
         """Convert channel argument to a list of valid channel indices as strings."""
@@ -814,6 +878,8 @@ class TekAwg:
         return int(self.query('SEQ:LENGTH?'))
 
     def set_seq_length(self, length):
+        if length > self.properties['MAX_SEQUENCE_LENGTH']:
+            raise RuntimeError('Sequence length to large: %d > %d' % (length, self.properties['MAX_SEQUENCE_LENGTH']))
         self.write('SEQ:LENGTH '+str(length))
 
     def get_seq_element_jmp_ind(self, element_index):
@@ -870,7 +936,7 @@ class TekAwg:
                              jmp_ind=int(jmp_ind))
 
     def set_seq_element(self, element_index: int, seq_element: SequenceEntry, no_write=False):
-        cmd = []
+        command_group = CommandGroup()
 
         if len(seq_element.entries) != self.n_channels:
             raise ValueError('Invalid channel count')
@@ -881,34 +947,35 @@ class TekAwg:
             if entry is not None:
                 if isinstance(entry, str):
                     entry = '"%s"' % entry.strip('"')
-                cmd.append(base + 'WAV{ch} {entry}'.format(ch=ch + 1, entry=entry))
+                command_group.append(base, 'WAV{ch} {entry}'.format(ch=ch + 1, entry=entry))
 
         if seq_element.wait is not None:
-            cmd.append(base + 'TWA %d' % bool(seq_element.wait))
+            command_group.append(base, 'TWA %d' % bool(seq_element.wait))
 
         if seq_element.loop_inf is not None:
-            cmd.append(base + 'LOOP:INF %d' % bool(seq_element.loop_inf))
+            command_group.append(base + 'LOOP:', 'INF %d' % bool(seq_element.loop_inf))
 
         if seq_element.loop_count is not None:
-            cmd.append(base + 'LOOP:COUN %d' % seq_element.loop_count)
+            command_group.append(base + 'LOOP:', 'COUN %d' % seq_element.loop_count)
 
         if seq_element.jmp_ind is not None:
-            cmd.append(base + 'JTAR:IND %d' % seq_element.jmp_ind)
+            command_group.append(base + 'JTAR:', 'IND %d' % seq_element.jmp_ind)
 
         if seq_element.jmp_type is not None:
-            cmd.append(base + 'JTAR:TYPE %s' % seq_element.jmp_type)
+            command_group.append(base + 'JTAR:', 'TYPE %s' % seq_element.jmp_type)
 
         if seq_element.goto_state is not None:
-            cmd.append(base + 'GOTO:STAT %d' % bool(seq_element.goto_state))
+            command_group.append(base + 'GOTO:', 'STAT %d' % bool(seq_element.goto_state))
 
         if seq_element.goto_ind is not None:
-            cmd.append(base + 'GOTO:IND %d' % seq_element.goto_ind)
+            command_group.append(base + 'GOTO:', 'IND %d' % seq_element.goto_ind)
 
+        cmd = command_group.build()
         if no_write:
             return cmd
 
         else:
-            self.write(';'.join(cmd))
+            self.write(cmd)
 
     def get_seq_list(self):
         """Get the current list of waveforms in the sequencer"""
