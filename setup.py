@@ -1,4 +1,5 @@
 from setuptools import setup
+import re
 
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -11,8 +12,18 @@ classifiers = [
 with open("README.md", "r") as fp:
     tek_awg_long_description = fp.read()
 
+with open("tek_awg.py", "r") as f:
+    module_contents = f.read()
+
+def extract_version(version_file):
+    version_match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]",
+                              version_file, re.M)
+    if version_match:
+        return version_match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
 setup(name='tek_awg',
-      version='0.1',
+      version=extract_version(module_contents),
       author='Simon Humpohl',
       author_email='simon.humpohl@rwth-aachen.de',
       url='https://github.com/qutech/TekAwg/',
