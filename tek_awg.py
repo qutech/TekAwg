@@ -3,6 +3,7 @@
 
 06.2018 Modified by Simon Hmupohl
 """
+__version__ = "0.2"
 
 from typing import Sequence, Union, Optional, Tuple, Iterable, cast, Callable, Any
 import types
