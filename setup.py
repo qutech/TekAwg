@@ -8,12 +8,19 @@ classifiers = [
     "Topic :: System :: Hardware :: Hardware Drivers",
 ]
 
+with open("README.md", "r") as fp:
+    tek_awg_long_description = fp.read()
+
 setup(name='tek_awg',
       version='0.1',
-      description='Tektronix AWG interface for python',
       author='Simon Humpohl',
       author_email='simon.humpohl@rwth-aachen.de',
       url='https://github.com/qutech/TekAwg/',
       py_modules=['tek_awg'],
-      install_requires=['numpy', 'pyvisa']
+      install_requires=['numpy', 'pyvisa'],
+
+      description='Tektronix AWG interface for python',
+      long_description=tek_awg_long_description,
+      long_description_content_type="text/markdown",
+      license="GNU GPLv3",
 )
