@@ -131,6 +131,7 @@ class Waveform:
 
 
 class SequenceEntry:
+    """This class represents a row of the sequencing list."""
     __slots__ = ('entries', 'wait', 'loop_inf', 'loop_count', 'goto_ind', 'goto_state', 'jmp_type', 'jmp_ind')
 
     def __init__(self, entries,
@@ -221,10 +222,14 @@ class TekAwg:
 
         AWG_IP = '127.0.0.1'
 
-        tek = TekAwg.connect_to_ip(AWG_IP)
+        tek = TekAwg.connect_raw_visa_socket(AWG_IP, port=4567)
         awg.print_waveform_list()
         awg.close()
     """
+
+    DEFAULT_RESOURCE_PROPERTIES = dict(read_termination='\n',
+                                       query_delay=1e-3,
+                                       timeout=10000)
 
     def __init__(self, instrument: MessageBasedResource):
         """Do nothing but setting private properties"""
@@ -286,12 +291,18 @@ class TekAwg:
 
     @classmethod
     def connect_to_ip(cls, ip: str, backend='@ni'):
-        """Connect to instrument via VXI-11 and set timeouts etc to meaningful values"""
+        """Connect to instrument via VXI-11 and set timeouts etc to meaningful values. The recommended way(by tektronix)
+        is to use the raw socket."""
         address = 'TCPIP::{ip}::INSTR'.format(ip=ip)
         instrument = pyvisa.ResourceManager(backend).open_resource(address,
-                                                                   read_termination='\n',
-                                                                   query_delay=1e-3,
-                                                                   timeout=10000)
+                                                                   **cls.DEFAULT_RESOURCE_PROPERTIES)
+        return cls(cast(MessageBasedResource, instrument))
+
+    @classmethod
+    def connect_raw_visa_socket(cls, ip: str, port: int, backend=None):
+        address = 'TCPIP0::{ip}::{port}::SOCKET'.format(ip=ip, port=port)
+        instrument = pyvisa.ResourceManager(backend).open_resource(address,
+                                                                   **cls.DEFAULT_RESOURCE_PROPERTIES)
         return cls(cast(MessageBasedResource, instrument))
 
     def close(self):
