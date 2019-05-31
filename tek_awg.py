@@ -3,7 +3,7 @@
 
 06.2018 Modified by Simon Hmupohl
 """
-__version__ = "0.2"
+__version__ = "0.2.1"
 
 from typing import Sequence, Union, Optional, Tuple, Iterable, cast, Callable, Any
 import types
@@ -168,7 +168,7 @@ class SequenceEntry:
             if self.goto_ind != other.goto_ind:
                 return False
 
-        if self.jmp_type.lower() in ('ind', 'index'):
+        if self.jmp_type is not None and self.jmp_type.lower() in ('ind', 'index'):
             if self.jmp_ind != other.jmp_ind:
                 return False
 
