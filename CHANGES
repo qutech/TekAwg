@@ -1,0 +1,7 @@
+Changelog for tek_awg
+=====================
+
+0.2.1
+-----
+
+- Fix bug in sequence entry comparison
